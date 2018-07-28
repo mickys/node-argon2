@@ -6,6 +6,11 @@
 #include <nan.h>
 #include "../argon2/include/argon2.h"
 
+#include <v8.h>
+using namespace std;
+using namespace v8;
+
+
 #ifndef _MSC_VER
 namespace {
 #endif
@@ -33,6 +38,13 @@ public:
         return out;
     }
 
+    v8::Local<v8::Object> simple(const std::string& hash) const
+    {
+        auto out = Nan::New<v8::Object>();
+        Nan::Set(out, Nan::New("hash").ToLocalChecked(), Nan::CopyBuffer(hash.c_str(), hash.size()).ToLocalChecked());
+        return out;
+    }
+
     std::string salt;
 
     uint32_t hash_length = {};
@@ -44,8 +56,7 @@ public:
     argon2_type type = {};
 };
 
-argon2_context make_context(char* buf, const std::string& plain,
-        const Options& options) {
+argon2_context make_context(char* buf, const std::string& plain, const Options& options) {
     argon2_context ctx;
 
     ctx.out = reinterpret_cast<uint8_t*>(buf);
@@ -81,27 +92,29 @@ public:
     void Execute() override
     {
 #ifdef _MSC_VER
-        char* buf = new char[options.hash_length];
+        char* buf = new char[32];
 #else
-        char buf[options.hash_length];
+        char buf[32];
 #endif
+        genHash(buf);
+        std::fill_n(buf, 32, 0);
+#ifdef _MSC_VER
+        delete[] buf;
+#endif
+    }
 
+    void genHash(char * buf )
+    {
         auto ctx = make_context(buf, plain, options);
         int result = argon2_ctx(&ctx, options.type);
 
         if (result != ARGON2_OK) {
-            /* LCOV_EXCL_START */
+            // LCOV_EXCL_START
             SetErrorMessage(argon2_error_message(result));
-            /* LCOV_EXCL_STOP */
+            // LCOV_EXCL_STOP
         } else {
             hash.assign(buf, options.hash_length);
         }
-
-        std::fill_n(buf, options.hash_length, 0);
-
-#ifdef _MSC_VER
-        delete[] buf;
-#endif
     }
 
     void HandleOKCallback() override
@@ -121,6 +134,80 @@ private:
     Options options;
 
     std::string hash;
+};
+
+
+class BatchWorker final: public Nan::AsyncWorker {
+public:
+    BatchWorker(Nan::Callback* callback, vector<string> buffers, Options options) :
+        Nan::AsyncWorker{callback, "argon2:BatchWorker"},
+        buffers{std::move(buffers)},
+        options{std::move(options)}
+    {}
+
+    void Execute() override
+    {
+#ifdef _MSC_VER
+        char* buf = new char[32];
+#else
+        char buf[32];
+#endif
+        std::string hash;
+
+        for (string& val : buffers) {
+
+            auto ctx = make_context(buf, val, options);
+            int result = argon2_ctx(&ctx, options.type);
+
+            if (result != ARGON2_OK) {
+                // LCOV_EXCL_START
+                SetErrorMessage(argon2_error_message(result));
+                // LCOV_EXCL_STOP
+            } else {
+                // copy hash_length bytes from buf to hash var
+                hash.assign(buf, options.hash_length);
+            }
+
+            // save hash to results
+            results.push_back( hash );
+
+            // reset buffer
+            std::fill_n(buf, 32, 0);
+        }
+
+#ifdef _MSC_VER
+        delete[] buf;
+#endif
+    }
+
+    void HandleOKCallback() override
+    {
+        Nan::HandleScope scope;
+
+        // Convert string Vector to V8 array
+        Handle<Array> resultArray = Nan::New<v8::Array>( results.size() );
+        for (unsigned i=0; i < results.size(); i++) {
+
+            // v8::Local<v8::Value> thisval = Nan::New(results[i]).ToLocalChecked();
+            v8::Local<v8::Value> thisval = Nan::CopyBuffer(results[i].c_str(), results[i].size()).ToLocalChecked();
+
+            Nan::Set( resultArray, i, thisval );
+        }
+
+        v8::Local<v8::Value> argv[] = {
+            Nan::Null(),
+            resultArray,
+        };
+
+        callback->Call(2, argv, async_resource);
+    }
+
+
+private:
+
+    vector<string> buffers;
+    vector<string> results;
+    Options options;
 };
 
 using size_type = std::string::size_type;
@@ -176,6 +263,37 @@ NAN_METHOD(Hash) {
     Nan::AsyncQueueWorker(worker);
 }
 
+NAN_METHOD(Batch) {
+    assert(info.Length() == 3);
+
+    if (!info[0]->IsArray()) {
+        return Nan::ThrowError(Nan::New(
+          "aMethodName - expected arg 0 to be of type: ARRAY"
+        ).ToLocalChecked());
+    }
+
+
+    vector<string> buffers;
+    Handle<Array> jsArray = Handle<Array>::Cast(info[0]);
+
+    for (unsigned int i = 0; i < jsArray->Length(); i++) {
+        buffers.push_back( to_string( jsArray->Get(i) ) );
+    }
+
+
+    auto&& options = Nan::To<v8::Object>(info[1]).ToLocalChecked();
+
+    auto callback = new Nan::Callback{
+        Nan::To<v8::Function>(info[2]).ToLocalChecked()
+    };
+
+    auto worker = new BatchWorker{
+        callback, buffers, extract_options(options),
+    };
+
+    Nan::AsyncQueueWorker(worker);
+}
+
 NAN_MODULE_INIT(init) {
     auto limits = Nan::New<v8::Object>();
 
@@ -208,7 +326,9 @@ NAN_MODULE_INIT(init) {
     Nan::Set(target, Nan::New("version").ToLocalChecked(),
             Nan::New<v8::Number>(ARGON2_VERSION_NUMBER));
 
+    Nan::Export(target, "batch", Batch);
     Nan::Export(target, "hash", Hash);
 }
+
 
 NODE_MODULE(argon2_lib, init);

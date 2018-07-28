@@ -20,6 +20,57 @@ const defaults = Object.freeze({
 
 const type2string = []
 
+const batch = (buffers, options) => {
+  options = Object.assign({}, defaults, options)
+
+  return new Promise((resolve, reject) => {
+      for (const key of Object.keys(limits)) {
+    const {max, min} = limits[key]
+    const value = options[key]
+    if (value > max || value < min) {
+      reject(new Error(`Invalid ${key}, must be between ${min} and ${max}.`))
+    }
+  }
+
+  // TODO: after transition time, drop this check
+  if (options.memoryCost < 32) {
+    const exp = options.memoryCost
+    process.emitWarning('[argon2] deprecated usage of options.memoryCost', {
+      detail: 'The argon2 package now uses value of memory cost instead of exponent.\n' +
+      `Replacing memoryCost ${exp} with 2**${exp}=${1 << exp}.\n`
+    })
+    options.memoryCost = 1 << exp
+  }
+
+  if ('salt' in options) {
+    return resolve(options.salt)
+  }
+
+  crypto.randomBytes(options.saltLength, (err, salt) => {
+    /* istanbul ignore if */
+    if (err) {
+      return reject(err)
+    }
+    return resolve(salt)
+  })
+}).then(salt => {
+    return new Promise((resolve, reject) => {
+      bindings.batch(buffers, Object.assign(options, {salt}), (err, value) => {
+      /* istanbul ignore if */
+      if (err) {
+        return reject(err)
+      }
+      return resolve(value)
+    })
+})
+}).then(output => {
+    if (options.raw) {
+    return output; //.hash
+  }
+  return phc.serialize(output)
+})
+}
+
 const hash = (plain, options) => {
   options = Object.assign({}, defaults, options)
 
